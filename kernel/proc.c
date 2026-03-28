@@ -310,6 +310,8 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  np->trace_mask = p->trace_mask; // 子进程继承父进程的 trace 掩码
+
   pid = np->pid;
 
   release(&np->lock);

@@ -5,6 +5,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysinfo.h"
 
 uint64
 sys_exit(void)
@@ -101,4 +102,42 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+// lab trace 原型
+int
+sys_trace() {
+  int mask;
+  argint(0, &mask);
+  myproc()->trace_mask = mask; // 保存掩码到 proc 结构
+  return 0;
+}
+
+extern uint64 freemem_bytes(void); // 我们会在 kalloc.c 实现
+
+uint64
+sys_sysinfo(void)
+{
+    struct sysinfo info;
+    struct proc *p = myproc();
+    uint64 addr;
+
+    argaddr(0, &addr);
+
+    info.freemem = freemem_bytes();
+
+    int n = 0;
+    struct proc *cur;
+    for(cur = proc; cur < &proc[NPROC]; cur++){
+        acquire(&cur->lock);
+        if(cur->state != UNUSED)
+            n++;
+        release(&cur->lock);
+    }
+    info.nproc = n;
+
+    if(copyout(p->pagetable, addr, (char *)&info, sizeof(info)) < 0)
+        return -1;
+
+    return 0;
 }

@@ -3,6 +3,8 @@ typedef unsigned long size_t;
 typedef long int off_t;
 #endif
 struct stat;
+struct sysinfo;
+int sysinfo(struct sysinfo *);
 
 // system calls
 int fork(void);
@@ -26,6 +28,7 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int trace(int mask);  // trace 系统调用
 #ifdef LAB_NET
 int connect(uint32, uint16, uint16);
 #endif
