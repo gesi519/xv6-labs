@@ -60,6 +60,7 @@ sys_sleep(void)
   acquire(&tickslock);
   ticks0 = ticks;
 #ifdef LAB_TRAPS
+  backtrace(); // 打印调用栈
 #endif
   while(ticks - ticks0 < n){
     if(killed(myproc())){
@@ -140,4 +141,33 @@ sys_sysinfo(void)
         return -1;
 
     return 0;
+}
+
+uint64
+sys_sigreturn(void) {
+  struct proc *p = myproc();
+  // 恢复用户态寄存器
+  *(p->trapframe) = p->alarm_trapframe;
+  p->alarm_on = 0; // 关闭 alarm
+
+  return p->trapframe->a0;
+}
+
+uint64
+sys_sigalarm(void) {
+  int ticks;
+  uint64 handler;
+
+  argint(0, &ticks);
+  argaddr(1, &handler);
+
+  struct proc *p = myproc();
+
+  p->alarm_interval = ticks;
+  p->alarm_handler = handler;
+  p->alarm_ticks_left = ticks;
+  p->alarm_on = 0;
+  memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
+
+  return 0;
 }

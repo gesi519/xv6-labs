@@ -191,7 +191,8 @@ UPROGS=\
 	$U/_sleep\
 	$U/_pingpong\
 	$U/_trace\
-	$U/_sysinfotest
+	$U/_sysinfotest\
+	$U/_alarmtest
 
 
 

@@ -106,6 +106,13 @@ struct proc {
   char name[16];               // Process name (debugging)
 
   int trace_mask;
+
+  int alarm_interval;
+  int alarm_ticks_left;
+  uint64 alarm_handler;
+
+  struct trapframe alarm_trapframe;
+  int alarm_on;
 };
 
 extern struct proc proc[NPROC];

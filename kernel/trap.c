@@ -77,8 +77,22 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if(which_dev == 2) {
+    // 这里才处理 alarm
+    if(p->alarm_interval > 0 && p->alarm_on == 0){
+      p->alarm_ticks_left--;
+      if(p->alarm_ticks_left == 0){
+        /*printf("alarm fire: pid=%d interval=%d left=%d on=%d handler=%p epc=%p scause=%p\n",
+         p->pid, p->alarm_interval, p->alarm_ticks_left,
+         p->alarm_on, p->alarm_handler, p->trapframe->epc, r_scause());*/
+        p->alarm_trapframe = *(p->trapframe); // save current trapframe
+        p->alarm_on = 1;
+        p->alarm_ticks_left = p->alarm_interval; // reset ticks left
+        p->trapframe->epc = p->alarm_handler;
+      }
+    }
     yield();
+  }
 
   usertrapret();
 }
