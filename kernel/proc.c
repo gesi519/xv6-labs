@@ -130,6 +130,7 @@ found:
   p->alarm_handler = 0;
   p->alarm_on = 0;
   memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
+  p->trace_mask = 0;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -181,6 +182,7 @@ freeproc(struct proc *p)
   p->alarm_handler = 0;
   p->alarm_on = 0;
   memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
+  p->trace_mask = 0;
 }
 
 // Create a user page table for a given process, with no user memory,

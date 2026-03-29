@@ -189,7 +189,7 @@ syscall(void)
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
-    int r = syscalls[num]();
+    uint64 r = syscalls[num]();
     p->trapframe->a0 = r;
 
     // 如果 trace_mask 中该系统调用被置位，则打印
