@@ -126,7 +126,7 @@ found:
   p->state = USED;
 
   p->alarm_interval = 0;
-  p->alarm_ticks_left = 0;
+  p->alarm_ticks = 0;
   p->alarm_handler = 0;
   p->alarm_on = 0;
   memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
@@ -177,7 +177,7 @@ freeproc(struct proc *p)
   p->state = UNUSED;
 
   p->alarm_interval = 0;
-  p->alarm_ticks_left = 0;
+  p->alarm_ticks = 0;
   p->alarm_handler = 0;
   p->alarm_on = 0;
   memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
@@ -325,7 +325,7 @@ fork(void)
   np->trace_mask = p->trace_mask; // 子进程继承父进程的 trace 掩码
 
   np->alarm_interval = 0;
-  np->alarm_ticks_left = 0;
+  np->alarm_ticks = 0;
   np->alarm_handler = 0;
   np->alarm_on = 0;
   memset(&np->alarm_trapframe, 0, sizeof(np->alarm_trapframe));

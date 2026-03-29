@@ -147,7 +147,8 @@ uint64
 sys_sigreturn(void) {
   struct proc *p = myproc();
   // 恢复用户态寄存器
-  *(p->trapframe) = p->alarm_trapframe;
+  memmove(p->trapframe, &p->alarm_trapframe, sizeof(struct trapframe));
+  p->alarm_ticks = 0; // 重置 alarm_ticks
   p->alarm_on = 0; // 关闭 alarm
 
   return p->trapframe->a0;
@@ -165,9 +166,8 @@ sys_sigalarm(void) {
 
   p->alarm_interval = ticks;
   p->alarm_handler = handler;
-  p->alarm_ticks_left = ticks;
+  p->alarm_ticks = 0;
   p->alarm_on = 0;
-  memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
 
   return 0;
 }

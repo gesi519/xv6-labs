@@ -108,7 +108,7 @@ struct proc {
   int trace_mask;
 
   int alarm_interval;
-  int alarm_ticks_left;
+  int alarm_ticks;
   uint64 alarm_handler;
 
   struct trapframe alarm_trapframe;

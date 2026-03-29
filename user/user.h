@@ -55,5 +55,5 @@ int atoi(const char*);
 int memcmp(const void *, const void *, uint);
 void *memcpy(void *, const void *, uint);
 int statistics(void*, int);
-int sigalarm(int ticks, void (*handler)());
+int sigalarm(int , void (*handler)());
 int sigreturn(void);
