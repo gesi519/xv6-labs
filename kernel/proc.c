@@ -125,6 +125,12 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+  p->alarm_interval = 0;
+  p->alarm_ticks = 0;
+  p->alarm_handler = 0;
+  p->alarm_on = 0;
+  memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
+
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
@@ -169,6 +175,12 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  p->alarm_interval = 0;
+  p->alarm_ticks = 0;
+  p->alarm_handler = 0;
+  p->alarm_on = 0;
+  memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -311,6 +323,12 @@ fork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+
+  np->alarm_interval = 0;
+  np->alarm_ticks = 0;
+  np->alarm_handler = 0;
+  np->alarm_on = 0;
+  memset(&np->alarm_trapframe, 0, sizeof(np->alarm_trapframe));
 
   release(&np->lock);
 
