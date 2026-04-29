@@ -1,0 +1,220 @@
+Lab 2 Traps Report
+
+姓名：葛思
+
+1. 实验概述
+
+本次实验主要完成了两个部分：
+1. backtrace
+2. sigalarm / sigreturn
+
+其中 backtrace 部分相对直接，理解栈帧结构以后实现难度不大。真正耗费时间最多的是
+`usertests -q` 中 `copyout` 测试的失败问题。虽然一开始看起来像是 traps 或 alarm 的实现问题，
+但最后定位发现，根因实际上与工具链和最终链接出来的用户程序段权限有关。
+因此本报告将重点描述我是如何定位并解决 `usertests` 问题的。
+
+2. Backtrace 部分
+
+在 backtrace 的实现中，我使用 `r_fp()` 获取当前 frame pointer，然后按照 RISC-V 的栈帧布局向上回溯：
+- 返回地址保存在 `fp - 8`
+- 上一个 frame pointer 保存在 `fp - 16`
+
+由于 xv6 中每个 kernel stack 占用一个页，因此我使用当前 frame pointer 所在页的上下边界作为停止条件，
+保证只在当前内核栈页中回溯。
+
+完成实现后，我在 `sys_sleep()` 中调用 `backtrace()`，再用 `addr2line -e kernel/kernel`
+将打印出的地址映射回源码位置，结果与预期调用链一致，因此可以确认 backtrace 功能正确。
+
+3. Alarm 部分
+
+在 alarm 部分，我在 `struct proc` 中加入了以下字段：
+- alarm_interval
+- alarm_ticks
+- alarm_handler
+- alarm_trapframe
+- alarm_on
+
+实现思路如下：
+- 在 `usertrap()` 中，只在时钟中断时处理 alarm 逻辑
+- 当进程消耗的 tick 数达到设定间隔时，保存当前用户态 trapframe
+- 将 `epc` 改为用户提供的 handler 地址，使得返回用户态后执行 handler
+- 在 `sys_sigreturn()` 中恢复保存的 trapframe，并恢复原来的 `a0`
+- 使用 `alarm_on` 防止 handler 重入
+
+在修复了若干细节问题后，`alarmtest` 四个测试最终都能通过。
+
+4. 重点问题：usertests -q 中 copyout 测试失败
+
+4.1 初始现象
+
+虽然 `alarmtest` 已经全部通过，但 `usertests -q` 仍然失败，错误信息如下：
+
+test copyout: usertrap(): unexpected scause 0x000000000000000c
+sepc=0x0000000000056e0a stval=0x0000000000056e0a
+
+一开始我怀疑有两种可能：
+1. 自己的 alarm 实现仍然破坏了 trapframe
+2. 第一个 lab 的修改影响了第二个 lab
+
+但是在回退和重新测试后，发现即使不保留 lab1 的修改，`copyout` 仍然失败，
+所以问题并不只是 traps/alarm 实现本身造成的。
+
+4.2 第一个关键线索
+
+出问题的是 `usertests` 中的 `copyout` 测试，它的核心代码大致是：
+
+    read(fd, (void*)0, 8192);
+
+这个测试的意图是：故意把一个明显不合法的用户地址（地址 0）传给 `read()`，
+看内核是否能正确拒绝。
+
+正常情况下应该是：
+- 地址 0 对应的是用户程序代码页
+- 代码页不应该可写
+- 所以内核中的 `copyout()` 应该直接返回 `-1`
+- 测试继续运行，但不会崩溃
+
+然而实际现象是，程序并没有简单返回 `-1`，而是在之后跳到了一个非法地址并崩溃。
+这说明更像是“用户代码本身被改坏了”。
+
+4.3 用 addr2line 判断崩溃地址是否合法
+
+我使用了命令：
+
+    addr2line -e user/_usertests 0x56e0a
+
+得到结果：
+
+    ??:0
+
+这个结果非常重要。它说明 `0x56e0a` 不是 `_usertests` 里的正常合法代码地址。
+也就是说，程序不是正常运行到某一行出错，而是执行流已经被破坏，跳到了一个垃圾地址。
+
+4.4 用 readelf 检查用户程序 ELF 段权限
+
+接着我检查了用户程序的 ELF program headers：
+
+    readelf -l user/_usertests
+
+在我的机器上，输出显示：
+- 只有一个 `LOAD` 段
+- 该段权限是 `RWE`
+- `.text .rodata .eh_frame .data .bss` 全部落在同一个段里
+
+这就是整个问题的关键。
+
+这意味着：
+- 用户程序的代码段 `.text` 和数据段 `.data/.bss` 没有分开
+- 地址 0 对应的那一页不仅可执行，而且还可写
+- 所以 `copyout()` 在检查用户页权限时，会错误地认为地址 0 是可写的
+
+这也就解释了为什么 `read(fd, 0, 8192)` 没有失败。
+
+4.5 用 GDB 彻底锁定问题
+
+为了不只是停留在“怀疑段权限有问题”的层面，我进一步使用了 GDB 来观察实际内存变化过程。
+
+我使用 `make CPUS=1 qemu-gdb`，然后连接 GDB，在 `copyout()` 上设置条件断点：
+
+    break copyout if dstva==0
+
+当断点命中时，说明 `usertests copyout` 确实进入了：
+
+- `read()`
+- `fileread()`
+- `readi()`
+- `either_copyout()`
+- `copyout()`
+
+此时我检查地址 0 对应页的 PTE 权限，得到：
+
+    0x5f
+
+这包含：
+- PTE_V
+- PTE_R
+- PTE_W
+- PTE_X
+- PTE_U
+
+也就是说，这一页同时具有：
+- 用户可访问
+- 可执行
+- 可写
+
+这正是不应该发生的情况。用户代码页不应该带写权限。
+
+接着，我查看了 `copyout()` 中 `memmove()` 执行前后的物理页内容：
+
+1. 执行前：
+地址 0 对应的物理页中是正常的机器指令字节
+
+2. 执行后：
+同一个物理页开头变成了 README 文件中的 ASCII 文本：
+
+    xv6 is a ...
+
+这一步就完全锁定了问题：
+- `read(fd, 0, 8192)` 最终调用了 `copyout()`
+- `copyout()` 因为页表权限错误，没有拒绝地址 0
+- 内核把 README 的内容真的写进了用户代码页
+- 用户代码被覆盖后，后续执行流损坏
+- 最终跳转到非法地址 `0x56e0a`
+- 触发 instruction page fault（`scause = 0xc`）
+
+因此，这个问题并不是简单的 traps 逻辑 bug，而是“用户程序链接结果导致代码页权限错误”。
+
+4.6 为什么我和同学的结果不同
+
+一开始我很困惑，因为我的同学在 Ubuntu 24 下运行时并没有遇到这个问题。
+
+后面对比后发现，差别不在 Ubuntu 版本，而在交叉工具链：
+
+- 同学使用的是 `riscv64-unknown-elf-*`
+- 我使用的是 `riscv64-linux-gnu-*`
+
+在同学的环境中，`readelf -l user/_usertests` 的结果是：
+- 一个 `RE` 段（`.text .rodata`）
+- 一个 `RW` 段（`.data .bss`）
+
+而在我的环境中，最初生成的是：
+- 一个 `RWE` 段，所有 section 都混在一起
+
+所以最终根因是：不同工具链生成的 ELF program headers 不同。
+这说明问题不是“Ubuntu 24 一定有问题”，而是“我使用的 `riscv64-linux-gnu` 工具链链接行为与实验默认环境不一致”。
+
+4.7 发现、锁定、修改、解决
+
+这个问题的解决过程可以总结为四步：
+
+第一步：发现
+- `alarmtest` 已通过
+- 但 `usertests -q` 一直在 `copyout` 处失败
+- 错误表现为 instruction page fault，而不是普通的 `read()` 返回 `-1`
+
+第二步：锁定
+- 用 `addr2line` 发现崩溃地址 `0x56e0a` 不是正常用户代码地址
+- 用 `readelf` 发现 `_usertests` 被链接为单个 `RWE` 段
+- 用 GDB 观察到地址 0 对应的 PTE 具有 `W` 和 `X`
+- 用 GDB 观察到 `memmove()` 确实把 README 内容写进了用户代码页
+
+第三步：修改
+- 我先通过修改 `user/user.ld`，显式分离 text/data 段，验证这个猜想
+- 修改后 `copyout` 立即恢复正常，这证明了段权限问题就是根因
+- 随后切换到更适合 xv6 的 `riscv64-unknown-elf-*` 工具链
+
+第四步：解决
+- 使用正确工具链后，用户程序被正确链接为：
+  - `RE` 段：`.text .rodata`
+  - `RW` 段：`.data .bss`
+- 地址 0 对应页不再可写
+- `copyout()` 正常返回 `-1`
+- `usertests -q` 通过
+
+5. 实验结果
+
+在修复上述问题后：
+- backtrace 功能正常
+- alarmtest 全部通过
+- usertests -q 全部通过
+- make grade 通过
