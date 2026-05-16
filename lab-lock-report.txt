@@ -1,0 +1,255 @@
+Lab Lock Report
+
+本次 lab 的主要目标是减少 xv6 内核中两个热点锁的竞争：
+一个是物理内存分配器中的 kmem 锁，
+另一个是 buffer cache 中的 bcache 锁。
+
+一、Memory Allocator 部分
+
+原始 xv6 中，所有空闲物理页都挂在同一个 freelist 上，
+并且由一把全局 kmem.lock 保护。
+
+当多个 CPU 同时执行 kalloc() 或 kfree() 时，
+它们都会竞争同一把 kmem.lock，
+因此 kalloctest 中会看到较高的 #test-and-set 数量。
+
+为了解决这个问题，我将原来的全局 kmem 结构改成了每个 CPU 一个 kmem 结构：
+
+struct {
+  struct spinlock lock;
+  struct run *freelist;
+} kmem[NCPU];
+
+这样每个 CPU 都有自己的空闲页链表和自己的锁。
+
+在 kinit() 中，我为每个 CPU 的 kmem[i].lock 进行初始化，
+并且保持 freerange() 的原始逻辑，
+让启动时运行 freerange() 的 CPU 接收所有初始空闲页。
+
+在 kfree() 中，我使用 push_off() 关闭中断，
+然后通过 cpuid() 得到当前 CPU 的编号，
+再把被释放的物理页插入到当前 CPU 对应的 freelist 中。
+
+这样大多数释放操作只需要访问本 CPU 的 freelist，
+避免所有 CPU 都竞争同一把锁。
+
+在 kalloc() 中，我首先从当前 CPU 的 freelist 中尝试分配一页。
+如果当前 CPU 的 freelist 不为空，
+就直接取出链表头并返回。
+
+如果当前 CPU 的 freelist 为空，
+则需要从其他 CPU 的 freelist 中偷取空闲页。
+
+最终 kalloctest 输出中 kmem 相关的 tot 降为 0，
+test1、test2、test3 均通过。
+
+在这个过程中，我还遇到过一次 usertrap 异常。
+后来发现这不是 kalloc() 实现本身的问题，
+而是 lab4 分支最初没有正确继承 lab3 的修改，
+导致之前 lab3 中已经解决过的用户程序链接和权限问题重新出现。
+重新基于 lab3 创建 lab4 分支并重新实现本 lab 后，
+该异常消失，kalloctest 正常通过。
+
+二、Buffer Cache 部分
+
+第二部分的目标是减少 buffer cache 中 bcache.lock 的竞争。
+
+原始 xv6 中，所有 struct buf 都放在一个全局双向链表中，
+这个链表由一把全局 bcache.lock 保护。
+
+当多个进程同时读不同文件或不同磁盘块时，
+即使它们访问的 block 完全不同，
+也必须竞争同一把 bcache.lock。
+
+bcachetest 的 test0 会制造这种并发访问场景。
+原始实现中，bcache.lock 的 #test-and-set 数量较高，
+因此 test0 会失败。
+
+为了减少竞争，我将 buffer cache 改成哈希桶结构。
+
+我定义了多个 bucket：
+
+struct bucket {
+  struct spinlock lock;
+  struct buf head;
+};
+
+每个 bucket 有一把自己的 spinlock，
+并且有一个 dummy head 作为双向链表的哨兵节点。
+
+这里 head 使用 struct buf head，
+而不是 struct buf *head。
+原因是它只是链表哨兵节点，
+不表示真正的磁盘缓存块。
+使用哨兵节点可以让链表插入、删除和遍历逻辑更统一，
+不需要额外处理空链表、首节点和尾节点等特殊情况。
+
+我使用哈希函数根据 dev 和 blockno 将磁盘块映射到对应 bucket。
+这样不同 block 大概率落到不同 bucket，
+不同进程访问不同 block 时就不再竞争同一把全局 bcache.lock。
+
+在 binit() 中，
+我初始化所有 bucket 的锁和 dummy head。
+同时初始化 bcache.buf[NBUF] 中的所有 buffer，
+并将它们插入到 bucket 链表中。
+
+一开始我把所有空闲 buffer 都插入 bucket 0。
+这样功能上可以工作，
+但是 bcachetest 中 bucket 锁竞争仍然很高。
+原因是所有缓存 miss 时都会倾向于从 bucket 0 找空闲 buffer，
+导致 bucket 0 成为新的热点。
+
+后来我改为将初始 buffer 分散插入不同 bucket，
+即按 round-robin 的方式插入：
+第 0 个 buffer 放入 bucket 0，
+第 1 个 buffer 放入 bucket 1，
+依此类推。
+
+此外，我也将 bucket 数量从 13 增加到 31。
+虽然 NBUF 只有 30，
+但是 bucket 数可以大于 buffer 数。
+这样可以减少不同 block 被 hash 到同一个 bucket 的概率。
+
+bget() 是本部分最关键的函数。
+
+在 bget() 中，我首先根据 dev 和 blockno 计算目标 bucket。
+然后只获取目标 bucket 的锁，
+在该 bucket 的链表中查找目标 block 是否已经被缓存。
+
+如果找到了对应 buffer，
+就增加它的 refcnt，
+释放 bucket 锁，
+然后再获取该 buffer 的 sleeplock 并返回。
+
+这里必须注意：
+不能在持有 bucket spinlock 的时候调用 acquiresleep()。
+因为 sleeplock 可能等待较长时间，
+如果持有 bucket spinlock 等待 sleeplock，
+会导致其他 CPU 长时间自旋等待 bucket 锁，
+从而产生大量 test-and-set。
+
+如果目标 block 没有缓存，
+则需要找一个 refcnt == 0 的 buffer 进行复用。
+为了保证同一个磁盘块在 cache 中最多只有一份，
+我使用 bcache.lock 作为 eviction_lock，
+串行化缓存 miss 时的 buffer 复用过程。
+
+在获取 eviction_lock 之后，
+我会重新检查目标 bucket，
+因为在第一次释放 bucket 锁到获得 eviction_lock 的间隙中，
+其他 CPU 可能已经把目标 block 加入缓存。
+如果重新检查发现目标 block 已经存在，
+就直接增加 refcnt 并返回。
+
+如果仍然不存在，
+就从各个 bucket 中寻找 refcnt == 0 的 buffer。
+找到 victim buffer 后，
+如果 victim 本来就在目标 bucket 中，
+就直接修改它的 dev、blockno、valid 和 refcnt。
+
+如果 victim 位于其他 bucket，
+则先从旧 bucket 链表中删除它，
+再插入到目标 bucket 链表中。
+这样可以保证之后根据 hash(dev, blockno) 能在正确 bucket 中找到它。
+
+一开始我的 victim 搜索总是从 bucket 0 开始，
+导致 bucket 0 和前几个 bucket 竞争较高。
+后来我改成从目标 bucket h 开始搜索：
+第一个搜索 h，
+然后搜索 h+1、h+2，
+最后绕回前面的 bucket。
+
+这样不同 block 的缓存 miss 会从不同 bucket 开始寻找 victim，
+避免所有 miss 都集中竞争 bucket 0。
+
+brelse() 中，我先释放 buffer 的 sleeplock，
+然后根据 b->dev 和 b->blockno 找到对应 bucket，
+获取该 bucket 的锁并减少 refcnt。
+
+bpin() 和 bunpin() 也类似，
+不再使用全局 bcache.lock，
+而是只获取对应 bucket 的锁来修改 refcnt。
+
+bread() 和 bwrite() 基本保持原样。
+bread() 调用 bget() 获得 locked buffer，
+如果 buffer 无效则从磁盘读取。
+bwrite() 要求调用者已经持有 buffer 的 sleeplock，
+然后将 buffer 写回磁盘。
+
+三、调试过程和问题
+
+在 memory allocator 部分，
+我最初只实现了 per-CPU freelist 和单页 stealing。
+这个版本能够运行，
+但 kalloctest 的 test1 中 kmem 的锁竞争仍然很高。
+
+后来分析发现，
+因为 freerange() 初始时把所有空闲页都放到了一个 CPU 的 freelist 上，
+其他 CPU 如果每次只偷一页，
+就会反复竞争那个 CPU 的 kmem 锁。
+
+因此我改成批量 stealing，
+一次从其他 CPU 的 freelist 中取出多页，
+第一页返回给本次 kalloc()，
+剩余页放入当前 CPU 的 freelist。
+修改后 kmem 的 tot 降为 0。
+
+在 buffer cache 部分，
+我最初只把全局链表改成了 13 个 bucket。
+功能测试可以通过，
+但是 bcachetest 的 test0 中 bucket 锁竞争仍然很高，
+tot 约为几十万。
+
+通过观察输出可以看到，
+竞争集中在若干 bcache.bucket 锁上。
+我判断原因主要有三个：
+第一，bucket 数量较少，hash 冲突较多；
+第二，所有初始 buffer 都放在 bucket 0；
+第三，寻找 victim buffer 时总是从 bucket 0 开始。
+
+因此我做了三处优化：
+将 NBUCKET 增加到 31；
+在 binit() 中将初始 buffer 分散放入不同 bucket；
+在 bget() 中从目标 bucket 开始循环寻找 victim。
+
+这些修改之后，bucket 锁竞争明显下降，
+bcachetest 可以通过。
+
+四、最终结果
+
+最终，kalloctest 中：
+test1 OK，
+test2 OK，
+test3 OK，
+kmem 相关的 tot 为 0。
+
+最终，bcachetest 中：
+test0 OK，
+test1 OK，
+test2 OK，
+bcache 相关锁竞争满足实验要求。
+
+同时，我继续运行了 usertests -q，
+用于确认修改没有破坏 xv6 文件系统、进程和内存管理的基本正确性。
+
+五、总结
+
+本次 lab 的核心思想是减少共享全局锁的粒度。
+
+在 kalloc 中，
+我把一个全局 freelist 拆成每个 CPU 一个 freelist，
+让大多数分配和释放操作只访问本 CPU 的数据结构。
+当本 CPU 空闲页不足时，
+再从其他 CPU 批量偷取空闲页。
+
+在 buffer cache 中，
+我把一个全局 buffer 链表拆成多个哈希桶，
+每个 bucket 有自己的锁。
+这样访问不同 block 时可以并发进行，
+不再全部竞争同一把 bcache.lock。
+
+这两个任务都体现了同一个原则：
+在保证正确性的前提下，
+减少不必要的共享，
+缩小锁保护范围，
+并避免在持有 spinlock 时执行可能长时间等待的操作。
