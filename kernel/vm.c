@@ -315,7 +315,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -324,13 +323,16 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
+    }
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+
+    // 子进程也引用了这个物理页，所以引用计数 +1
+    kref_inc(pa);
   }
   return 0;
 
@@ -366,8 +368,12 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(va0 >= MAXVA)
       return -1;
     pte = walk(pagetable, va0, 0);
+    if((*pte & PTE_COW) != 0){
+      if(cow_alloc(pagetable, va0) < 0)
+        return -1;
+    }
     if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
+      (*pte & PTE_W) == 0)
       return -1;
     pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
@@ -473,4 +479,42 @@ void
 vmprint(pagetable_t pagetable) {
   printf("page table %p\n", pagetable);
   vmprint_rec(pagetable, 0);
+}
+
+int
+cow_alloc(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  if(va >= MAXVA)
+    return -1;
+
+  va = PGROUNDDOWN(va);
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)    return -1;
+  if((*pte & PTE_V) == 0)    return -1;
+  if((*pte & PTE_U) == 0)    return -1;
+  if((*pte & PTE_COW) == 0)    return -1;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  if(kref_cnt(pa) == 1) {
+    // 只有当前进程引用了这个物理页，可以直接修改 PTE 的权限
+    flags = (flags & ~PTE_COW) | PTE_W;
+    *pte = PA2PTE(pa) | flags;
+    return 0;
+  }
+
+  // 还有其他进程引用了这个物理页，需要复制一份物理页，并修改 PTE 的权限
+  if((mem = kalloc()) == 0)
+    return -1;
+  memmove(mem, (char*)pa, PGSIZE);
+  
+  *pte = PA2PTE((uint64)mem) | ((flags | PTE_W) & ~PTE_COW);
+  kfree((void*)pa);
+
+  return 0;
 }

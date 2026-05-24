@@ -188,6 +188,9 @@ int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 void            vmprint(pagetable_t);
 pte_t*          walk(pagetable_t, uint64, int);
+int             cow_alloc(pagetable_t, uint64);
+void            kref_inc(uint64);
+int             kref_cnt(uint64);
 
 // plic.c
 void            plicinit(void);
