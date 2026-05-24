@@ -1,0 +1,279 @@
+lab-pgtbl 实验报告
+
+一、实验目标
+
+本次实验主要围绕 xv6 中的 RISC-V 页表机制展开。
+
+实验要求我们理解用户页表的结构、页表项的权限位、虚拟地址到物理地址的映射过程，以及内核如何通过页表为用户进程提供特殊功能。
+
+本次实验共完成三个主要任务。
+
+第一个任务是通过 USYSCALL 共享只读页优化 getpid 系统调用。
+
+第二个任务是实现 vmprint 函数，用于递归打印页表内容。
+
+第三个任务是实现 pgaccess 系统调用，用于检测用户页中哪些页面被访问过。
+
+二、任务一：通过 USYSCALL 优化 getpid
+
+传统的 getpid 系统调用需要用户程序通过 ecall 进入内核。
+
+进入内核后，内核执行 sys_getpid 函数，再将当前进程的 pid 返回给用户程序。
+
+这个过程涉及用户态和内核态之间的切换，因此存在一定开销。
+
+本任务的目标是在每个进程的用户地址空间中映射一页只读页面。
+
+这一页的虚拟地址为 USYSCALL。
+
+该页中保存一个 struct usyscall 结构体，其中包含当前进程的 pid。
+
+用户态提供的 ugetpid 函数可以直接从 USYSCALL 对应的虚拟地址读取 pid。
+
+这样就避免了陷入内核，从而加快 getpid 这类简单系统调用的执行速度。
+
+三、任务一的实现过程
+
+首先，我在 struct proc 中添加了一个 struct usyscall *usyscall 字段。
+
+这个字段用于保存当前进程对应的 USYSCALL 物理页地址。
+
+然后，我在 allocproc 函数中使用 kalloc 为每个新进程分配一页物理内存。
+
+分配成功后，我使用 memset 将该页清零。
+
+随后，我将当前进程的 pid 写入 p->usyscall->pid。
+
+这样每个进程在创建时都会拥有一页保存自身 pid 的特殊页面。
+
+接着，我在 proc_pagetable 函数中调用 mappages，将该物理页映射到用户页表中的 USYSCALL 虚拟地址。
+
+映射权限设置为 PTE_R | PTE_U。
+
+其中 PTE_R 表示用户程序可以读取该页。
+
+PTE_U 表示用户态可以访问该页。
+
+我没有设置 PTE_W，因为用户程序不应该修改该页中的 pid。
+
+我也没有设置 PTE_X，因为该页不是代码页，不需要执行权限。
+
+最后，我在 freeproc 中释放 p->usyscall 对应的物理页。
+
+同时，我在 proc_freepagetable 中使用 uvmunmap 取消 USYSCALL 的虚拟地址映射。
+
+这里 uvmunmap 的最后一个参数设置为 0，因为物理页已经在 freeproc 中释放，proc_freepagetable 只需要删除页表映射关系。
+
+四、任务一的实验结果
+
+完成上述修改后，我运行 pgtbltest。
+
+测试输出显示 ugetpid_test: OK。
+
+这说明 USYSCALL 页面已经被正确映射，用户态的 ugetpid 函数能够直接读取当前进程 pid。
+
+因此，任务一完成。
+
+五、任务二：实现 vmprint 打印页表
+
+第二个任务要求实现 vmprint 函数，用来打印指定页表的结构。
+
+RISC-V xv6 使用 Sv39 地址转换机制。
+
+在 Sv39 中，一个虚拟地址被分为三级虚拟页号和页内偏移。
+
+每一级虚拟页号占 9 位。
+
+因此，每一级页表有 2^9 = 512 个页表项。
+
+每个页表项占 8 字节。
+
+一个页表页大小为 4096 字节。
+
+所以一个页表页正好可以容纳 4096 / 8 = 512 个 PTE。
+
+vmprint 的作用是递归遍历这三级页表，并打印所有有效的页表项。
+
+六、任务二的实现过程
+
+我在 kernel/vm.c 中实现了 vmprint 函数。
+
+为了方便递归遍历，我额外实现了一个辅助函数 vmprint_rec。
+
+vmprint_rec 接收两个参数。
+
+第一个参数是当前要打印的 pagetable。
+
+第二个参数是当前递归深度 depth。
+
+在 vmprint_rec 中，我遍历当前页表中的 512 个 PTE。
+
+如果某个 PTE 没有设置 PTE_V，则说明该页表项无效，不需要打印。
+
+如果某个 PTE 设置了 PTE_V，则打印该 PTE 的索引、PTE 本身的值以及该 PTE 指向的物理地址。
+
+打印物理地址时使用 PTE2PA 宏从 PTE 中提取物理地址。
+
+为了显示页表层级，我根据 depth 打印不同数量的缩进符号。
+
+如果一个有效 PTE 没有设置 PTE_R、PTE_W、PTE_X 中的任何一个权限位，那么它不是叶子 PTE，而是指向下一级页表。
+
+对于这种情况，我将 PTE 中保存的物理地址转换为 pagetable_t，并递归调用 vmprint_rec。
+
+如果一个有效 PTE 设置了 PTE_R、PTE_W 或 PTE_X，则说明它是叶子 PTE，代表真正的物理页映射，不再继续递归。
+
+我将 vmprint_rec 定义为 static 函数。
+
+这样它只在 kernel/vm.c 内部可见，不会暴露给其他文件。
+
+对外只暴露 vmprint 函数。
+
+随后，我在 kernel/defs.h 中添加 vmprint 的函数声明，使得 exec.c 可以调用它。
+
+最后，我在 kernel/exec.c 中，在 return argc 之前加入判断。
+
+当 p->pid == 1 时，调用 vmprint(p->pagetable)。
+
+这样 xv6 在第一个用户进程 init 完成 exec 后，会打印它的页表。
+
+七、任务二的实验结果
+
+完成实现后，启动 xv6 时可以看到 page table 开头的页表打印结果。
+
+输出中包含不同层级的缩进，每一行都显示 PTE 的索引、PTE 的值以及对应物理地址。
+
+这说明 vmprint 能够正确递归遍历页表，并打印有效页表项。
+
+该任务帮助我直观理解了 xv6 用户页表的三级结构。
+
+八、任务三：实现 pgaccess 系统调用
+
+第三个任务要求实现 pgaccess 系统调用。
+
+该系统调用用于检测一段用户虚拟地址范围内的页面是否被访问过。
+
+它接收三个参数。
+
+第一个参数是起始虚拟地址。
+
+第二个参数是要检查的页面数量。
+
+第三个参数是用户态保存结果 bitmask 的地址。
+
+如果第 i 个页面被访问过，那么结果 bitmask 的第 i 位应该被设置为 1。
+
+如果第 i 个页面没有被访问过，那么对应位保持为 0。
+
+这个功能依赖 RISC-V 页表项中的 Accessed bit。
+
+在 RISC-V 中，PTE_A 表示该页面是否被访问过。
+
+当硬件页表遍历器解析某个虚拟地址并访问对应页面时，会设置该页面 PTE 中的 PTE_A 位。
+
+因此，内核可以通过检查 PTE_A 来判断某个页面是否被访问过。
+
+九、任务三的实现过程
+
+首先，我在 kernel/riscv.h 中定义了 PTE_A。
+
+PTE_A 的值为 1L << 6。
+
+这是因为 RISC-V PTE 中的第 6 位表示 Accessed bit。
+
+然后，我在 kernel/defs.h 中添加 walk 函数的声明。
+
+pgaccess 需要根据用户虚拟地址找到对应的 PTE。
+
+walk 函数正好可以完成这个工作。
+
+我没有使用 walkaddr。
+
+因为 walkaddr 返回的是物理地址，而本任务需要检查和修改 PTE 中的标志位。
+
+所以必须使用 walk 获取 pte_t *。
+
+接着，我在 kernel/sysproc.c 中实现 sys_pgaccess 函数。
+
+该函数首先使用 argaddr 和 argint 读取系统调用参数。
+
+argaddr 用于读取用户虚拟地址参数。
+
+argint 用于读取页面数量参数。
+
+为了方便使用 unsigned int 保存结果，我限制最多检查 32 个页面。
+
+之后，我获取当前进程的页表 p->pagetable。
+
+对每一个待检查页面，我计算其虚拟地址 start_va + i * PGSIZE。
+
+然后使用 walk 找到该虚拟地址对应的 PTE。
+
+如果 PTE 不存在或无效，则返回错误。
+
+如果 PTE 中设置了 PTE_A，则说明该页被访问过。
+
+此时我将结果 mask 的第 i 位设置为 1。
+
+设置方式为 mask |= 1U << i。
+
+同时，我会清除该 PTE 的 PTE_A 位。
+
+清除 PTE_A 非常重要。
+
+如果不清除，之后再次调用 pgaccess 时，旧的访问记录仍然会保留，导致测试结果错误。
+
+最后，我使用 copyout 将内核中的 mask 复制回用户空间。
+
+这里不能直接解引用用户指针。
+
+因为用户指针是用户虚拟地址，内核需要通过当前进程的页表安全地写入用户空间。
+
+所以必须使用 copyout。
+
+十、任务三的系统调用连接
+
+在检查代码时，我使用 grep -R "pgaccess" -n . 查看 pgaccess 是否已经接入系统调用表。
+
+结果显示 kernel/syscall.c 中已经声明了 sys_pgaccess，并在 syscalls 数组中添加了 SYS_pgaccess 对应项。
+
+kernel/syscall.h 中也已经定义了 SYS_pgaccess 的系统调用编号。
+
+user/usys.pl 中已经添加了 entry("pgaccess")。
+
+user/user.h 中也已经声明了用户态 pgaccess 函数。
+
+因此，我不需要重复添加系统调用入口，只需要保证 sys_pgaccess 的实现正确。
+
+十一、任务三的实验结果
+
+完成 pgaccess 后，我重新编译并运行 pgtbltest。
+
+测试依次执行 ugetpid_test 和 pgaccess_test。
+
+ugetpid_test 通过说明 USYSCALL 映射正确。
+
+pgaccess_test 通过说明 pgaccess 能够正确检测访问位，并且能够正确清除 PTE_A。
+
+最终 pgtbltest 中相关测试通过。
+
+十二、实验中遇到的问题
+
+在任务一中，我曾遇到 struct usyscall 不完整类型的问题。
+
+这个问题的原因是 proc.c 中使用了 p->usyscall->pid，但编译器不知道 struct usyscall 的完整定义。
+
+这是因为#ifdef导致vscode无法识别。
+
+在任务二中，需要注意 vmprint_rec 的递归条件。
+
+只有当一个有效 PTE 没有设置 PTE_R、PTE_W、PTE_X 时，它才表示下一级页表。
+
+如果对叶子 PTE 继续递归，就会把普通物理页错误地当成页表页访问，可能导致错误。
+
+在任务三中，最容易出错的是忘记清除 PTE_A。
+
+如果只读取 PTE_A 而不清除，那么下一次 pgaccess 会读到上一次访问留下的状态。
+
+这会导致 pgaccess_test 报 incorrect access bits set。
+
+因此，在检测到 PTE_A 后必须执行 *pte &= ~PTE_A。

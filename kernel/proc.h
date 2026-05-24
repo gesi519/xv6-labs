@@ -113,6 +113,7 @@ struct proc {
 
   struct trapframe alarm_trapframe;
   int alarm_on;
+  struct usyscall *usyscall;   // 新增：给用户态只读访问的共享页
 };
 
 extern struct proc proc[NPROC];
