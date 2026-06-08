@@ -57,3 +57,4 @@ void *memcpy(void *, const void *, uint);
 int statistics(void*, int);
 int sigalarm(int , void (*handler)());
 int sigreturn(void);
+int symlink(char*, char*);

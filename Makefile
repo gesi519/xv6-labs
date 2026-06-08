@@ -192,7 +192,9 @@ UPROGS=\
 	$U/_pingpong\
 	$U/_trace\
 	$U/_sysinfotest\
-	$U/_alarmtest
+	$U/_alarmtest\
+	$U/_bigfile\
+	$U/_symlinktest
 
 
 
