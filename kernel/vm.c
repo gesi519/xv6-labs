@@ -368,12 +368,25 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(va0 >= MAXVA)
       return -1;
     pte = walk(pagetable, va0, 0);
+    
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1;
+    // 如果是 COW 页，先处理成当前进程自己的可写页
     if((*pte & PTE_COW) != 0){
       if(cow_alloc(pagetable, va0) < 0)
         return -1;
+
+      // cow_alloc 修改了页表项，重新取一次更稳妥
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0)
+        return -1;
+      if((*pte & PTE_V) == 0)
+        return -1;
+
+      if((*pte & PTE_U) == 0)
+        return -1;
     }
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-      (*pte & PTE_W) == 0)
+    if((*pte & PTE_W) == 0)
       return -1;
     pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);

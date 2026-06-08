@@ -1,0 +1,147 @@
+本次实验实现了 xv6 中的 copy-on-write fork 机制。
+
+实验的目标是避免 fork 时立即复制父进程的全部用户内存，而是在父子进程真正写共享页面时才复制物理页。
+
+普通 xv6 的 fork 会在 uvmcopy 中为子进程分配新的物理页，并把父进程页面内容复制过去。
+
+这种做法在父进程占用内存较大时开销很大，并且如果子进程很快调用 exec，这些复制工作大多会被浪费。
+
+因此本实验将 fork 改为写时复制。
+
+在 fork 时，子进程不再分配新的物理页，而是让父进程和子进程的页表项共同指向同一个物理页。
+
+对于原本带有 PTE_W 权限的用户页，我在 uvmcopy 中清除了父进程和子进程页表项中的 PTE_W 标志。
+
+同时我使用 RISC-V 页表项中的 RSW 软件保留位定义了 PTE_COW 标志，用来表示该页是 copy-on-write 页面。
+
+这样父子进程虽然共享同一个物理页，但是该页在页表中表现为只读。
+
+当其中一个进程尝试写入该页时，CPU 会产生 store page fault。
+
+我在 usertrap 中增加了对写页面错误的处理。
+
+当 scause 表示 store page fault 时，内核通过 r_stval 取得出错的虚拟地址。
+
+然后内核调用 cow_alloc 处理该 COW 页面。
+
+cow_alloc 首先检查虚拟地址是否合法，并通过 walk 找到对应的页表项。
+
+如果页表项不存在、无效、不是用户页，或者没有 PTE_COW 标志，则说明这不是合法的 COW 写入，函数返回错误。
+
+如果该页确实是 COW 页，cow_alloc 会取出其对应的物理地址和页表权限。
+
+为了正确管理共享物理页，我在 kalloc.c 中为每个物理页维护了引用计数。
+
+引用计数数组的下标使用物理地址除以 PGSIZE 得到。
+
+每次 kalloc 分配出物理页时，我将该物理页的引用计数设置为 1。
+
+每次 uvmcopy 让子进程共享父进程物理页时，我调用引用计数增加函数，使该物理页引用计数加 1。
+
+每次进程不再引用某个物理页时，我通过 kfree 使引用计数减 1。
+
+只有当引用计数变为 0 时，kfree 才真正把该物理页放回空闲链表。
+
+由于我之前完成过 lock lab，kalloc 使用的是 per-CPU freelist 版本。
+
+因此本实验中我没有恢复原始的单个 freelist，而是在原有 per-CPU freelist 的基础上增加了引用计数机制。
+
+在 freerange 初始化空闲物理页时，我一开始错误地把引用计数设置成了 0。
+
+由于新的 kfree 会先检查引用计数是否小于 1，因此系统启动时就可能触发 panic: kfree ref。
+
+后来我将 freerange 中每个物理页的引用计数先设置为 1，再调用 kfree。
+
+这样初始化时 kfree 会把引用计数从 1 减到 0，然后正常把页面加入空闲链表。
+
+这是第一个重要的 bug 修复。
+
+在 cow_alloc 中，如果发现当前物理页引用计数为 1，说明该页已经只被当前进程使用。
+
+此时不需要重新分配物理页，只需要清除 PTE_COW 标志，并重新加上 PTE_W 权限即可。
+
+如果当前物理页引用计数大于 1，说明该物理页仍然被多个进程共享。
+
+此时 cow_alloc 会调用 kalloc 分配一个新的物理页。
+
+然后用 memmove 将旧物理页内容复制到新物理页。
+
+接着修改当前进程的页表项，使它指向新的物理页，并设置为可写且非 COW。
+
+最后调用 kfree 减少旧物理页的引用计数。
+
+这里的 kfree 不一定会真正释放旧页，因为如果还有其他进程引用该页，它只会将引用计数减 1。
+
+本实验还需要修改 copyout。
+
+copyout 是内核向用户空间写数据的函数。
+
+它不会像用户态写内存那样自动触发用户态 page fault。
+
+因此当 copyout 遇到 COW 页面时，内核必须主动调用 cow_alloc 处理该页面。
+
+我在 copyout 中增加了对 PTE_COW 的检查。
+
+如果目标用户页是 COW 页，copyout 会先调用 cow_alloc 将其转换为当前进程独占的可写页，然后再执行 memmove。
+
+调试过程中，我在 copyout 中遇到了一个空指针解引用的问题。
+
+最开始我在判断 pte 是否为 0 之前就访问了 *pte。
+
+usertests 的 copyout 测试会故意传入非法用户地址，这会导致 walk 返回 0。
+
+如果此时直接访问 *pte，内核会因为访问空指针而触发 kerneltrap。
+
+测试输出中出现了 scause 0xd、stval 0x0 和 panic: kerneltrap。
+
+后来我调整了 copyout 中的判断顺序。
+
+正确顺序是先调用 walk，然后先判断 pte 是否为 0，再判断 PTE_V 和 PTE_U，最后才能访问其他权限位。
+
+这是第二个重要的 bug 修复。
+
+随后我又在 copyout 中遇到了另一个问题。
+
+我一开始在处理 PTE_COW 之前就检查了 PTE_W。
+
+但是 COW 页在设计上本来就是清除了 PTE_W 的只读页。
+
+因此 copyout 遇到 COW 页时，如果先检查 PTE_W，就会直接返回错误，而不会执行 cow_alloc。
+
+这导致 cowtest 中的 file 测试出现 pipe() failed，usertests 中也出现多个 fork failed。
+
+后来我将 copyout 的逻辑改为先检查 PTE_V 和 PTE_U，再判断是否是 PTE_COW。
+
+如果是 COW 页，就先调用 cow_alloc。
+
+只有在 COW 处理完成后，才检查该页是否具有 PTE_W 权限。
+
+这是第三个重要的 bug 修复。
+
+在实验过程中还遇到了之前 pgtbl lab 代码残留导致的编译问题。
+
+由于 proc.c 中使用了 USYSCALL 和 struct usyscall，但是相关定义不完整，编译时出现了 USYSCALL undeclared 和 invalid use of undefined type struct usyscall。
+
+我在 memlayout.h 中补充了 USYSCALL 的地址定义。
+
+同时因为 memlayout.h 会被汇编文件 trampoline.S 包含，不能直接暴露 C 语言 struct 定义。
+
+因此我使用 #ifndef __ASSEMBLER__ 将 struct usyscall 包裹起来，避免汇编器解析 C 结构体时报错。
+
+这修复了 trampoline.o 编译阶段的 unrecognized opcode 错误。
+
+测试过程中还遇到了 QEMU GDB 端口 26000 被占用的问题。
+
+这是因为之前的 qemu-system-riscv64 进程没有退出，导致 make grade 无法重新启动 qemu-gdb。
+
+我使用 ss -ltnp 查看占用 26000 端口的进程，找到对应的 pid 后使用 kill -9 结束该进程。
+
+需要注意的是，ss 输出中的 pid 才是进程号，而 fd 是文件描述符，不能用 fd 作为 kill 的目标。
+
+修复端口占用后，make grade 可以继续运行。
+
+最终，本实验的核心修改包括在 riscv.h 中定义 PTE_COW，在 kalloc.c 中增加物理页引用计数，在 uvmcopy 中实现共享物理页和 COW 标记，在 trap.c 中处理 COW page fault，并在 vm.c 的 copyout 中处理内核写用户 COW 页的情况。
+
+通过这些修改，fork 不再立即复制所有用户内存，而是在写入共享页面时才真正复制物理页。
+
+这降低了 fork 的内存开销，也避免了 fork 后马上 exec 时产生大量无用复制。
